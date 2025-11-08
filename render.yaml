@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: quiplash-server
+    env: node
+    region: oregon # or your preferred region
+    plan: free # or starter/standard
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: SUPABASE_URL
+        sync: false # Set manually in Render dashboard
+      - key: SUPABASE_ANON_KEY
+        sync: false # Set manually in Render dashboard
+      - key: ALLOWED_ORIGINS
+        value: https://yourusername.github.io,https://your-unity-build.com # Update with your URLs
