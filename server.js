@@ -100,7 +100,7 @@ async function getOptimalPairing(gameId, playerIds, round) {
   return pairs;
 }
 
-// ==================== API ROUTES ====================
+// ==================== API ROUTES ===================
 
 // Health check
 app.get('/health', (req, res) => {
