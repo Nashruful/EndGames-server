@@ -415,13 +415,17 @@ app.get("/rooms/:code", async (req, res) => {
             if (room.started && room.state === "round_intro" && room.intro_deadline) {
                 const introMs = new Date(room.intro_deadline).getTime();
                 if (now > introMs) {
-                    await supabase
+                    const { data: introCleared } = await supabase
                         .from("rooms")
                         .update({ state: "answering_all", intro_deadline: null })
-                        .eq("id", room.id);
+                        .eq("id", room.id)
+                        .eq("state", "round_intro") // atomic guard: only one poller wins
+                        .select("id");
 
                     // refresh local room.state (so response is correct in this same request)
-                    room.state = "answering_all";
+                    if (introCleared && introCleared.length > 0) {
+                        room.state = "answering_all";
+                    }
                 }
             }
 
@@ -466,34 +470,42 @@ app.get("/rooms/:code", async (req, res) => {
                 const lbMs = new Date(room.leaderboard_deadline).getTime();
                 if (now > lbMs) {
 
-                    // Prevent multiple transitions by clearing deadline immediately
-                    await supabase
+                    // Atomic guard: only the poller that actually clears the deadline proceeds.
+                    // Without .select("id"), a second poller clears a now-null value (no-op row)
+                    // but still falls through to startRound(), creating a duplicate round.
+                    const { data: lbCleared, error: lbClearErr } = await supabase
                         .from("rooms")
                         .update({ leaderboard_deadline: null })
-                        .eq("id", room.id);
+                        .eq("id", room.id)
+                        .eq("state", "leaderboard")   // extra guard: must still be in leaderboard
+                        .not("leaderboard_deadline", "is", null) // must have a deadline to clear
+                        .select("id");
 
+                    if (lbClearErr) throw lbClearErr;
 
-                    const currentRound = activeRound?.number ?? 1;
-                    const nextRound = currentRound + 1;
+                    if (lbCleared && lbCleared.length > 0) {
+                        const currentRound = activeRound?.number ?? 1;
+                        const nextRound = currentRound + 1;
 
-                    if (nextRound > 3) {
-                        await supabase
-                            .from("rooms")
-                            .update({ state: "results", leaderboard_deadline: null })
-                            .eq("id", room.id);
+                        if (nextRound > 3) {
+                            await supabase
+                                .from("rooms")
+                                .update({ state: "results", leaderboard_deadline: null })
+                                .eq("id", room.id);
 
-                        room.state = "results";
-                    } else {
-                        console.log(`[rooms] leaderboard ended -> starting round ${nextRound} room ${code}`);
-                        await startRound(room, nextRound);
+                            room.state = "results";
+                        } else {
+                            console.log(`[rooms] leaderboard ended -> starting round ${nextRound} room ${code}`);
+                            await startRound(room, nextRound);
 
-                        // Invalidate ALL cache so getActiveRound returns the new round immediately.
-                        // Without this, the 10s cached activeRound still points to the old round,
-                        // causing Unity to use the wrong round intro video.
-                        cacheInvalidateRoom();
+                            // Invalidate ALL cache so getActiveRound returns the new round immediately.
+                            // Without this, the 10s cached activeRound still points to the old round,
+                            // causing Unity to use the wrong round intro video.
+                            cacheInvalidateRoom();
 
-                        // startRound sets state=round_intro
-                        room.state = "round_intro";
+                            // startRound sets state=round_intro
+                            room.state = "round_intro";
+                        }
                     }
                 }
             }
@@ -552,25 +564,19 @@ app.get("/rooms/:code", async (req, res) => {
                         if (!s.has(rpRow.player2_id)) missing.push(rpRow.player2_id);
 
                         for (const pid of missing) {
-                            // Insert placeholder only if still missing (race-safe)
-                            const { data: exists, error: exErr } = await supabase
-                                .from("answers")
-                                .select("id")
-                                .eq("round_prompt_id", rpRow.id)
-                                .eq("player_id", pid)
-                                .limit(1)
-                                .maybeSingle();
-
-                            if (exErr) throw exErr;
-
-                            if (!exists) {
-                                await supabase.from("answers").insert({
+                            // Atomic upsert: unique constraint prevents duplicate auto-fills
+                            // from concurrent pollers hitting this block simultaneously.
+                            const { error: autoFillErr } = await supabase.from("answers").upsert(
+                                {
                                     round_id: activeRound.id,
                                     round_prompt_id: rpRow.id,
                                     player_id: pid,
                                     text: "Didn't answer",
                                     created_at: nowIso(),
-                                });
+                                },
+                                { onConflict: "round_prompt_id,player_id", ignoreDuplicates: true }
+                            );
+                            if (!autoFillErr) {
                                 console.log(`[rooms] auto-filled missing answer for player ${pid} rp ${rpRow.id} room ${code}`);
                             }
                         }
@@ -597,21 +603,26 @@ app.get("/rooms/:code", async (req, res) => {
                 });
 
                 if (everyoneAnsweredNow) {
-                    console.log(`[rooms] all players answered (or auto-filled) in room ${code} -> switching to reveal`);
-
                     const revealSeconds = 10;
                     const revealDeadline = new Date(Date.now() + revealSeconds * 1000).toISOString();
 
-                    const { error: roomErr } = await supabase
+                    const { data: revealClaimed, error: roomErr } = await supabase
                         .from("rooms")
                         .update({
                             state: "reveal",
                             active_prompt_index: 0,
                             reveal_deadline: revealDeadline
                         })
-                        .eq("id", room.id);
+                        .eq("id", room.id)
+                        .eq("state", "answering_all") // atomic guard: only one poller wins
+                        .select("id");
 
                     if (roomErr) throw roomErr;
+
+                    if (revealClaimed && revealClaimed.length > 0) {
+                        console.log(`[rooms] all players answered (or auto-filled) in room ${code} -> switching to reveal`);
+                        cacheInvalidateRoom();
+                    }
                 }
             }
 
@@ -647,22 +658,30 @@ app.get("/rooms/:code", async (req, res) => {
                             const voteSeconds = 25;
                             const voteDeadline = new Date(Date.now() + voteSeconds * 1000).toISOString();
 
-                            await supabase
-                                .from("round_prompts")
-                                .update({ state: "voting", vote_deadline: voteDeadline })
-                                .eq("id", rpToVote.id);
-
-                            await supabase
+                            // atomic guard: only the first poller to clear reveal_deadline wins
+                            const { data: votingClaimed, error: revealRoomErr } = await supabase
                                 .from("rooms")
                                 .update({ state: "voting", reveal_deadline: null })
-                                .eq("id", room.id);
+                                .eq("id", room.id)
+                                .eq("state", "reveal") // atomic guard
+                                .select("id");
 
-                            // Refresh local state so this response is accurate
-                            room.state = "voting";
-                            room.reveal_deadline = null;
-                            cacheInvalidateRoom();
+                            if (revealRoomErr) throw revealRoomErr;
 
-                            console.log(`[rooms] reveal ended -> voting (idx=${idx}) room ${code}`);
+                            if (votingClaimed && votingClaimed.length > 0) {
+                                // Only update round_prompts if we actually claimed the transition
+                                await supabase
+                                    .from("round_prompts")
+                                    .update({ state: "voting", vote_deadline: voteDeadline })
+                                    .eq("id", rpToVote.id);
+
+                                // Refresh local state so this response is accurate
+                                room.state = "voting";
+                                room.reveal_deadline = null;
+                                cacheInvalidateRoom();
+
+                                console.log(`[rooms] reveal ended -> voting (idx=${idx}) room ${code}`);
+                            }
                         }
                     }
                 }
@@ -996,6 +1015,11 @@ app.post("/rooms/:code/start", async (req, res) => {
         }
 
 
+        // Idempotency guard: prevent double-tap from creating two rounds
+        if (room.started || room.state !== "lobby") {
+            return res.status(400).json({ success: false, error: "already_started" });
+        }
+
         // Get players (need 4 to match Unity start button logic)
         const players = await getPlayers(room.id);
         if (players.length < 4) {
@@ -1016,9 +1040,70 @@ app.post("/rooms/:code/start", async (req, res) => {
 });
 
 /**
+ * POST /rooms/:code/reset  (DEV ONLY)
+ * Wipes all game data for this room and resets it to lobby state.
+ * Does NOT delete room_players — players stay joined and can start immediately.
+ * Deletes in FK-safe order: votes -> answers -> round_prompts -> rounds.
+ */
+app.post("/rooms/:code/reset", async (req, res) => {
+    try {
+        const code = (req.params.code || "").toUpperCase();
+        const room = await getRoomByCode(code, true);
+        if (!room) return res.status(404).json({ success: false, error: "no_room" });
+
+        // Fetch all round IDs for this room so we can delete child data
+        const { data: rounds, error: rErr } = await supabase
+            .from("rounds")
+            .select("id")
+            .eq("room_id", room.id);
+
+        if (rErr) throw rErr;
+
+        const roundIds = (rounds || []).map(r => r.id);
+
+        if (roundIds.length > 0) {
+            // Delete in FK-safe order
+            const { error: vErr } = await supabase.from("votes").delete().in("round_id", roundIds);
+            if (vErr) throw vErr;
+
+            const { error: aErr } = await supabase.from("answers").delete().in("round_id", roundIds);
+            if (aErr) throw aErr;
+
+            const { error: rpErr } = await supabase.from("round_prompts").delete().in("round_id", roundIds);
+            if (rpErr) throw rpErr;
+
+            const { error: rdErr } = await supabase.from("rounds").delete().in("id", roundIds);
+            if (rdErr) throw rdErr;
+        }
+
+        // Reset room to clean lobby state
+        const { error: uErr } = await supabase
+            .from("rooms")
+            .update({
+                state: "lobby",
+                started: false,
+                active_prompt_index: 0,
+                reveal_deadline: null,
+                leaderboard_deadline: null,
+                intro_deadline: null,
+            })
+            .eq("id", room.id);
+
+        if (uErr) throw uErr;
+
+        cacheInvalidateRoom();
+        console.log(`[rooms] reset room ${code}`);
+        res.json({ success: true });
+    } catch (e) {
+        console.error("POST /rooms/:code/reset error:", e);
+        res.status(500).json({ success: false });
+    }
+});
+
+/**
  * POST /rooms/:code/intro_done
  * Unity TV tells backend: intro video finished -> move to answering_all
- * No playerId required (Unity is the authoritative �TV�)
+ * No playerId required (Unity is the authoritative�TV�)
  */
 app.post("/rooms/:code/intro_done", async (req, res) => {
     try {
@@ -1259,27 +1344,20 @@ app.post("/rooms/:code/answer", async (req, res) => {
                 return res.status(400).json({ success: false, error: "need_3_answers" });
             }
 
-            // If already answered (combined row exists), stop
-            const { data: existing, error: exErr } = await supabase
-                .from("answers")
-                .select("id")
-                .eq("round_prompt_id", rp.id)
-                .eq("player_id", playerId);
-
-            if (exErr) throw exErr;
-            if ((existing || []).length > 0) {
-                return res.json({ success: true, alreadyAnswered: true });
-            }
-
             const combined = clean.join("\n"); // keep as one unified answer
 
-            const { error: insErr } = await supabase.from("answers").insert({
-                round_id: round.id,
-                round_prompt_id: rp.id,
-                player_id: playerId,
-                text: combined,
-                created_at: nowIso(),
-            });
+            // Atomic upsert: unique constraint on (round_prompt_id, player_id) prevents duplicates.
+            // ignoreDuplicates=true means a second concurrent submit is silently ignored.
+            const { error: insErr } = await supabase.from("answers").upsert(
+                {
+                    round_id: round.id,
+                    round_prompt_id: rp.id,
+                    player_id: playerId,
+                    text: combined,
+                    created_at: nowIso(),
+                },
+                { onConflict: "round_prompt_id,player_id", ignoreDuplicates: true }
+            );
 
             if (insErr) throw insErr;
 
@@ -1296,26 +1374,18 @@ app.post("/rooms/:code/answer", async (req, res) => {
             return res.status(400).json({ success: false, error: "missing_text" });
         }
 
-        // Only 1 answer allowed
-        const { data: existingAnswers, error: exErr } = await supabase
-            .from("answers")
-            .select("id")
-            .eq("round_prompt_id", rp.id)
-            .eq("player_id", playerId);
-
-        if (exErr) throw exErr;
-
-        if ((existingAnswers || []).length >= 1) {
-            return res.json({ success: true, alreadyAnswered: true });
-        }
-
-        const { error: insErr } = await supabase.from("answers").insert({
-            round_id: round.id,
-            round_prompt_id: rp.id,
-            player_id: playerId,
-            text,
-            created_at: nowIso(),
-        });
+        // Atomic upsert: unique constraint on (round_prompt_id, player_id) prevents duplicates.
+        // ignoreDuplicates=true means a second concurrent submit is silently ignored.
+        const { error: insErr } = await supabase.from("answers").upsert(
+            {
+                round_id: round.id,
+                round_prompt_id: rp.id,
+                player_id: playerId,
+                text,
+                created_at: nowIso(),
+            },
+            { onConflict: "round_prompt_id,player_id", ignoreDuplicates: true }
+        );
 
         if (insErr) throw insErr;
 
@@ -1545,6 +1615,7 @@ app.get("/rooms/:code/reveal", async (req, res) => {
             success: true,
             prompt: promptText,
             roundPromptId: rp.id,
+            promptId: rp.prompt_id,
             answers: sortedAnswers
         });
 
@@ -1554,64 +1625,6 @@ app.get("/rooms/:code/reveal", async (req, res) => {
     }
 });
 
-
-app.get("/rooms/:code/results", async (req, res) => {
-    try {
-        const code = (req.params.code || "").toUpperCase();
-
-        const room = await getRoomByCode(code);
-        if (!room) return res.status(404).json({ success: false });
-
-        const round = await getActiveRound(room.id);
-        if (!round) return res.status(400).json({ success: false });
-
-        const rp = await getActiveRoundPrompt(round.id);
-        if (!rp || rp.state !== "done") {
-            return res.status(400).json({ success: false, error: "not_in_results" });
-        }
-
-        const { data: answers, error: ansErr } = await supabase
-            .from("answers")
-            .select("id, player_id, text")
-            .eq("round_prompt_id", rp.id);
-
-        if (ansErr) throw ansErr;
-
-        const { data: votes, error: vErr } = await supabase
-            .from("votes")
-            .select("answer_id")
-            .eq("round_prompt_id", rp.id);
-
-        if (vErr) throw vErr;
-
-        const voteCount = new Map();
-        for (const v of allVotes || []) {
-            voteCount.set(v.answer_id, (voteCount.get(v.answer_id) || 0) + 1);
-        }
-
-
-        const players = await getPlayers(room.id);
-        const nameById = new Map(players.map(p => [p.id, p.name]));
-
-        const results = (answers || []).map(a => ({
-            answerId: a.id,
-            playerId: a.player_id,
-            playerName: nameById.get(a.player_id) || "Player",
-            text: a.text,
-            votes: voteCount.get(a.id) || 0,
-        })).sort((a, b) => b.votes - a.votes);
-
-        res.json({
-            success: true,
-            roomCode: code,
-            results,
-            winner: results[0] || null,
-        });
-    } catch (e) {
-        console.error("GET /rooms/:code/results error:", e);
-        res.status(500).json({ success: false });
-    }
-});
 
 async function handleRoundResults(req, res) {
     try {

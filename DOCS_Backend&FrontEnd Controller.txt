@@ -1,0 +1,815 @@
+================================================================================
+   FULL DOCUMENTATION: Backend (server.rooms.js) & Controller (controller.html)
+   Voting System, Leaderboard & Bug Fixes
+================================================================================
+   Last updated: February 22, 2026
+================================================================================
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  PART A: BACKEND — server.rooms.js                                           ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ A.1. OVERVIEW                                                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  Node.js + Express server managing all game state for a Quiplash-style
+  party game. Uses Supabase (PostgreSQL) as the database.
+
+  Tech Stack:
+    - Node.js + ES Modules (import)
+    - Express.js
+    - @supabase/supabase-js
+    - dotenv for environment variables
+    - In-memory TTL cache
+
+  Port: process.env.PORT || 3000
+
+  Database Tables:
+    - rooms: game state, deadlines, active_prompt_index
+    - rounds: round number per room
+    - round_prompts: 2 prompts per round, each assigned player1/player2
+    - answers: player answers
+    - votes: player votes (unique constraint per round_prompt + voter)
+    - room_players: players in a room (seat order)
+    - prompts: question bank (categories: round1/round2/round3)
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ A.2. CACHE SYSTEM                                                            │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  In-memory Map with TTL (Time-To-Live):
+
+  Cache Keys & TTL:
+    room:{code}           → 1 second (room data)
+    players:{roomId}      → 10 seconds (player list)
+    activeRound:{roomId}  → 5 seconds (active round)
+    activeRoundPrompt:{id}→ 2 seconds (active prompt)
+    promptText:{id}       → 600 seconds (question text, rarely changes)
+
+  Functions:
+    cacheGet(key)        → returns value or undefined if expired
+    cacheSet(key, val, ttlMs) → set value with TTL
+    cacheInvalidate(prefix) → delete all keys with given prefix
+    cacheInvalidateRoom() → _cache.clear() — clears ALL cache
+
+  IMPORTANT: cacheInvalidateRoom() is called after every significant state
+  change (vote accepted, phase change, start round) so the next poll gets
+  fresh data.
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ A.3. HELPER FUNCTIONS                                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  makeRoomCode(len=4)
+    → Random 4-character string from "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+  makeOwnerToken()
+    → 16-byte random hex token
+
+  toUnixSeconds(date) → Unix timestamp in seconds
+  nowIso() → ISO 8601 timestamp for current time
+
+  getRoomByCode(code, skipCache?)
+    → Query rooms by code, cached 1s
+
+  getPlayers(roomId)
+    → Query room_players, sorted by seat, cached 10s
+    → Returns: [{id, name}]
+
+  getActiveRound(roomId)
+    → Query rounds for the highest round number, cached 5s
+    → Returns: {id, number, state}
+
+  getActiveRoundPrompt(roundId, skipCache?)
+    → Query round_prompts where state != "done", ordered by order_index ASC
+    → Returns the first non-done prompt (or null if all are done)
+
+  getPromptText(promptId)
+    → Query prompt text from the prompts table, cached 600s
+
+  getPromptsForRound(roomId, roundNumber, count)
+    → Fetch random prompts from the matching category
+    → Filter out prompts already used in this room
+    → Fisher-Yates shuffle, return `count` prompt IDs
+
+  categoryForRound(n)
+    → 1→"round1", 2→"round2", 3→"round3"
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ A.4. startRound(room, roundNumber)                                           │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  Core function to start a new round:
+
+  1. Fetch 4 players, shuffle randomly
+  2. INSERT row into rounds table (number=roundNumber, state="active")
+  3. Create 2 matchups: [player0 vs player1], [player2 vs player3]
+  4. Fetch 2 random prompts from the round's category
+  5. INSERT 2 round_prompts:
+     - order_index 0: prompt1, player1_id, player2_id
+     - state: "answering"
+     - answer_deadline: now + 15s (will be reset when intro finishes)
+     - vote_deadline: now + 105s
+  6. UPDATE room: state="round_intro", active_prompt_index=0
+
+  Default timers:
+    - Intro: 120 seconds (buffer for intro video)
+    - Answer: 15 seconds (placeholder, reset to 90s by /intro_done)
+    - Vote: 90 seconds
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ A.5. activateNextPrompt(roundId, currentOrderIndex, roomId)                  │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  Called after one prompt finishes voting:
+
+  1. Look for prompt with order_index = currentOrderIndex + 1
+  2. If none exists → enter "leaderboard" phase (10-second deadline)
+  3. If found → UPDATE room state="reveal", active_prompt_index=nextIndex,
+     reveal_deadline=now+10s
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ A.6. API ENDPOINTS                                                           │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  ─── POST /rooms ─────────────────────────────────────────────────────────────
+
+  Create a new room.
+  Request:  (no body needed)
+  Response: { success: true, code: "XERC" }
+
+  ─── GET /rooms/:code ────────────────────────────────────────────────────────
+
+  MAIN ENDPOINT — Unity polls this every 0.7 seconds.
+  What this endpoint does (VERY COMPLEX):
+
+  1. Fetch room data (skip cache for freshness)
+  2. Fetch players + activeRound in parallel
+
+  3. AUTO TRANSITIONS (performed during polling):
+
+     a. round_intro → answering_all
+        - Check intro_deadline. If expired → update state
+        - (Usually /intro_done triggers this, but this is a fallback)
+
+     b. post_vote_pause → reveal/leaderboard (next prompt)
+        - Check reveal_deadline (reused as pause timer)
+        - If expired → clear deadline (race-safe), call activateNextPrompt()
+        - Refresh room state from DB
+
+     c. leaderboard → round_intro (next round) OR results
+        - Check leaderboard_deadline. If expired:
+          * Round 1/2 finished → startRound(nextRound), cacheInvalidateRoom()
+          * Round 3 finished → state="results"
+
+  4. ANSWERING GATE:
+     - Check if ALL players have answered their assigned prompts
+     - If deadline passed → auto-fill "Didn't answer" for missing players
+     - If everyone answered → transition to "reveal" (10s deadline)
+
+  5. AUTO TRANSITION: reveal → voting
+     - If reveal_deadline passed → update round_prompt state="voting",
+       room state="voting", vote_deadline=now+25s
+
+  6. VOTING COMPLETION:
+     a. Auto-win if ≤1 real answer (ignoring "Didn't answer"):
+        - Award all eligible votes to the single real answer
+        - Immediately go to post_vote_pause
+     b. Normal: check if all eligible voters have voted OR deadline passed
+        - If yes → mark prompt "done" (race-safe: WHERE state="voting")
+        - Transition to "post_vote_pause" (10s pause, reuses reveal_deadline)
+
+  7. BUILD RESPONSE:
+     - Map players with answer status and vote counts
+     - Build voterIdsA / voterIdsB arrays
+
+  8. POST_VOTE_PAUSE FALLBACK:
+     - If state=post_vote_pause AND (rp=null OR rp.state!="voting"):
+       → Find last prompt with state="done"
+       → Count votes from that prompt
+       → Build voter ID lists from that prompt
+
+  Response: {
+    success, phase, players: [{id, name, answer, votes}],
+    started, currentRound, phaseEndTimestamp,
+    voterIdsA: [playerId, ...], voterIdsB: [playerId, ...]
+  }
+
+  ─── POST /rooms/:code/join ──────────────────────────────────────────────────
+
+  Player joins a room.
+  Request:  { name: "Player Name" }
+  Response: { success, playerId, isHost }
+  - First player automatically becomes host
+  - Checks for duplicate names (returns existing player if match)
+  - Max 4 players
+
+  ─── POST /rooms/:code/start ─────────────────────────────────────────────────
+
+  Host starts the game. Only the host is allowed.
+  Request:  { playerId }
+  Response: { success }
+  - Validation: must be host, minimum 4 players
+  - Calls startRound(room, 1)
+
+  ─── POST /rooms/:code/intro_done ────────────────────────────────────────────
+
+  Unity TV tells backend: intro video finished → move to answering_all.
+  Request:  (no body needed)
+  Response: { success }
+  - Resets answer_deadline to now+90s (timer starts now, not when start was called)
+  - Updates state → "answering_all"
+
+  ─── GET /rooms/:code/question?playerId=UUID ─────────────────────────────────
+
+  Controller requests the prompt assigned to a specific player.
+  Response: { success, question, roundNumber, roundPromptId }
+  - Finds round_prompt where player = player1 or player2
+  - If no playerId → returns prompt by active_prompt_index
+
+  ─── POST /rooms/:code/answer ────────────────────────────────────────────────
+
+  Player submits an answer.
+  Request:  { playerId, text } (rounds 1/2)
+            { playerId, texts: [a1, a2, a3] } (round 3)
+  Response: { success }
+  - Validation: prompt state must be "answering", deadline not passed
+  - Round 3: 3 answers combined into 1 row (separated by "\n")
+  - Checks for duplicates (only 1 answer per player per prompt)
+
+  ─── POST /rooms/:code/vote ──────────────────────────────────────────────────
+
+  Player votes for an answer.
+  Request:  { voterPlayerId, answerId }
+  Response: { success }
+  - Finds active prompt; falls back to last "done" prompt (race-safe)
+  - Validation: state must be "voting" or "done", voter must not be an answerer
+  - INSERT vote — unique constraint prevents double voting
+  - cacheInvalidateRoom() after successful vote
+
+  ─── GET /rooms/:code/voting ─────────────────────────────────────────────────
+
+  Controller gets voting options.
+  Response: {
+    success, roomCode, roundPromptId, promptText,
+    options: [{ answerId, playerId, playerName, text }]
+  }
+  - Filters out "Didn't answer" (not shown as an option)
+  - Round 3: collapses 3 answers per player into 1 option (joined with " | ")
+  - Race-safe: falls back to last "done" prompt if active prompt is null
+
+  ─── GET /rooms/:code/reveal ─────────────────────────────────────────────────
+
+  Unity TV gets reveal data for the current prompt.
+  Response: {
+    success, prompt, roundPromptId,
+    answers: [{ id, player_id, text }]
+  }
+  - Answers are SORTED: player1_id always at index 0, player2_id at index 1
+  - This is CRITICAL: Unity maps answers[0]→A (left), answers[1]→B (right)
+    and server maps voterIdsA→player1, voterIdsB→player2
+
+  ─── GET /rooms/:code/roundresults ───────────────────────────────────────────
+
+  Leaderboard data — cumulative scores across all rounds.
+  Response: {
+    success, questions: [...],
+    results: [{ id, name, totalVotes }]  ← sorted desc
+  }
+  - Only accessible when state="leaderboard"
+  - Counts votes across ALL rounds in the room (cumulative)
+  - Scoring: votes × 100 × multiplier
+    * Round 1: ×1 (100 per vote)
+    * Round 2: ×2 (200 per vote)
+    * Round 3: ×3 (300 per vote)
+  - Response includes `id` (player UUID) ← latest fix
+  - Sorted by totalVotes descending
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ A.7. GAME FLOW (Server Perspective)                                          │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  lobby
+    │
+    ▼ POST /start
+  round_intro ──[intro_deadline]──▶ answering_all
+    │                                    │
+    │ POST /intro_done (or auto)         │ [all answered / answer_deadline]
+    │                                    ▼
+    │                                  reveal ──[reveal_deadline 10s]──▶ voting
+    │                                                                      │
+    │                                                 [all voted / vote_deadline]
+    │                                                                      ▼
+    │                                                              post_vote_pause
+    │                                                                      │
+    │                     ┌── [more prompts] ◀─────────────────────────────┘
+    │                     │         │
+    │                     │         ▼
+    │                     │       reveal (prompt 2) → voting → post_vote_pause
+    │                     │                                          │
+    │                     └── [no more prompts] ◀───────────────────┘
+    │                                │
+    │                                ▼
+    │                          leaderboard ──[leaderboard_deadline 10s]
+    │                                │
+    ▼                                ▼
+  [round < 3]                   round_intro (next round)
+  [round = 3] ──────────────▶ results
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ A.8. RACE CONDITION HANDLING                                                 │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  1. Double Transition Prevention:
+     - All state UPDATEs use a WHERE clause: eq("state", <expected_state>)
+     - Example: UPDATE round_prompts SET state="done" WHERE state="voting"
+     - If 2 polling requests try to transition simultaneously, only 1 succeeds
+       (doneRows.length > 0)
+
+  2. Vote Race:
+     - POST /vote: unique constraint (round_prompt_id, voter_player_id)
+       prevents double voting → returns alreadyVoted: true
+
+  3. Cache Staleness:
+     - cacheInvalidateRoom() called after every significant change
+     - getRoomByCode(code, true) with skipCache for time-critical operations
+
+  4. Done Prompt Fallback (post_vote_pause):
+     - getActiveRoundPrompt() filters state!="done", may return null or the
+       next prompt. Fallback queries last "done" prompt for vote counts.
+     - Condition: !rp || (rp && rp.state !== "voting")
+       → covers both: second prompt done (rp=null) and first prompt done
+         (rp=next prompt with state="answering")
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ A.9. BACKEND BUG FIXES                                                       │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  Fix B1: /reveal — Sort Answers by player1_id
+  ─────────────────────────────────────────────
+  File: server.rooms.js, GET /rooms/:code/reveal
+  Problem: Answers returned in random DB order. If player2 appeared at
+           index 0, Unity mismatched vote icons and scores.
+  Solution: Added .sort() after query:
+           sortedAnswers = answers.sort(a => a.player_id === rp.player1_id ? -1 : 1)
+
+  Fix B2: post_vote_pause Fallback Condition
+  ──────────────────────────────────────────
+  File: server.rooms.js, GET /rooms/:code
+  Problem: When post_vote_pause was active for prompt 1, getActiveRoundPrompt()
+           returned prompt 2 (state="answering") not null. Since rp != null,
+           the fallback block never executed → vote count = 0 for prompt 1.
+  Solution: Changed condition from `!rp` to:
+           `!rp || (rp && rp.state !== "voting")`
+           Now fallback also triggers when rp exists but isn't the voted-on prompt.
+
+  Fix B3: Cache Invalidation After startRound()
+  ─────────────────────────────────────────────
+  File: server.rooms.js, leaderboard auto-transition in GET /rooms/:code
+  Problem: After startRound(room, nextRound), getActiveRound() still returned
+           the old round (cache 5-10s). Unity got the wrong currentRound
+           → played the previous round's video.
+  Solution: Added cacheInvalidateRoom() after startRound().
+
+  Fix B4: /roundresults — Missing Player ID
+  ──────────────────────────────────────────
+  File: server.rooms.js, function handleRoundResults()
+  Problem: Result rows only contained {name, totalVotes} without `id`.
+           Unity needed `id` to match players to seat indices
+           (playerLeaderboardObjects[seatIdx]).
+  Solution: Added `id: p.id` to every result row in rowByPlayer.
+
+  Fix B5: /voting Endpoint Staleness
+  ──────────────────────────────────
+  File: server.rooms.js, GET /rooms/:code/voting
+  Problem: getRoomByCode() used cache → stale voting data.
+  Solution: Use skipCache=true: getRoomByCode(code, true)
+           and getActiveRoundPrompt(round.id, true)
+
+  Fix B6: /vote Race-Safe Fallback
+  ────────────────────────────────
+  File: server.rooms.js, POST /rooms/:code/vote
+  Problem: Player voted but prompt was already marked "done" by another poll.
+           getActiveRoundPrompt() returned null → vote rejected.
+  Solution: If rp=null, fallback query the last prompt with state="done".
+           Accept votes while state="voting" OR "done" (grace window).
+
+  Fix B7: Leaderboard Auto-Transition Double Fire
+  ───────────────────────────────────────────────
+  File: server.rooms.js, leaderboard transition block
+  Problem: Multiple polling requests could trigger startRound() simultaneously.
+  Solution: Clear leaderboard_deadline immediately before transition:
+           UPDATE rooms SET leaderboard_deadline=null WHERE id=room.id
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  PART B: CONTROLLER — controller.html                                        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ B.1. OVERVIEW                                                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  Single-page HTML controller for testing. Used by players in a browser to
+  join a room, answer prompts, and vote.
+
+  Location: TestingForEndGame/TestingForEndGame/controller.html
+
+  Architecture:
+    - Vanilla HTML + JS (no framework)
+    - fetch() for API calls
+    - setInterval polling every 1 second
+    - UI sections: Join, Lobby, Answering, Voting
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ B.2. UI STRUCTURE                                                            │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ Header ──────────────────────────────────────────┐
+  │ Quiplash Controller (Dev)                          │
+  │ API Base URL input: http://localhost:3000           │
+  │ Room Code input + Name input + [Join] button       │
+  └───────────────────────────────────────────────────┘
+  ┌─ Lobby Card (hidden until joined) ────────────────┐
+  │ Room: XERC                                         │
+  │ You: abcd1234 (HOST)                               │
+  │ Status: lobby | started=false                      │
+  │ Players: 4                                         │
+  │ • Player1 ✅ (votes: 0)                            │
+  │ • Player2 (votes: 0)                               │
+  │ [Start Game] button (host only, >= 3 players)      │
+  │                                                     │
+  │ ┌─ Answer Card (during answering_all) ──────────┐ │
+  │ │ Answer the prompt:                              │ │
+  │ │ "What is your favorite color?"                  │ │
+  │ │ [Answer input 1] (always shown)                 │ │
+  │ │ [Answer input 2] (round 3 only)                 │ │
+  │ │ [Answer input 3] (round 3 only)                 │ │
+  │ │ [Submit] button                                  │ │
+  │ │ Status: "Answer submitted."                      │ │
+  │ └─────────────────────────────────────────────────┘ │
+  │                                                     │
+  │ ┌─ Vote Card (during voting) ───────────────────┐ │
+  │ │ Voting:                                         │ │
+  │ │ "What is your favorite color?"                  │ │
+  │ │ [Answer A button] [Answer B button]             │ │
+  │ │ Status: "Vote submitted. ✅"                     │ │
+  │ └─────────────────────────────────────────────────┘ │
+  └───────────────────────────────────────────────────┘
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ B.3. STATE VARIABLES                                                         │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  playerId (string)     — UUID from server after joining
+  isHost (bool)         — True if first player to join
+  roomCode (string)     — Room code that was joined
+  pollTimer (interval)  — setInterval ID for polling
+  ownerToken (string)   — Owner token from join response
+
+  Answering State:
+  hasAnswered (bool)           — True after submitting an answer
+  currentPromptId (string)     — roundPromptId from /question
+  currentRoundNumber (int)     — 1, 2, or 3
+  requiredAnswerCount (int)    — 1 (rounds 1/2) or 3 (round 3)
+
+  Voting State:
+  hasVoted (bool)              — True after clicking a vote button (optimistic)
+  isVoteConfirmed (bool)       — True after server confirms vote
+  currentVotePromptId (string) — roundPromptId for tracking prompt changes
+  votingOptions (array)        — Cached voting options
+  isFetchingVoting (bool)      — Guard preventing concurrent /voting fetches
+  isSubmittingVote (bool)      — Guard pausing polling during vote submission
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ B.4. FLOW                                                                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  1. JOIN FLOW:
+     • User fills room code + name → clicks Join
+     • POST /rooms/:code/join → receives playerId, isHost
+     • Starts polling every 1 second
+
+  2. POLLING (pollRoom):
+     • GET /rooms/:code → update status label, player list
+     • Checks phase from response:
+
+  3. ANSWERING PHASE (phase === "answering_all"):
+     • Show answer card
+     • Fetch prompt: GET /rooms/:code/question?playerId=xxx (once)
+     • Rounds 1/2: 1 input field. Round 3: 3 input fields.
+     • Submit: POST /rooms/:code/answer → disable inputs
+     • State resets when phase changes (hasAnswered=false, currentPromptId=null)
+
+  4. VOTING PHASE (phase === "voting"):
+     • Show vote card
+     • Fetch options: GET /rooms/:code/voting
+     • Check if player is an answerer → "You cannot vote"
+     • Render buttons per option (ONCE ONLY, not rebuilt every poll)
+     • Button click:
+       a. hasVoted=true, disable all buttons, pause polling
+       b. POST /rooms/:code/vote
+       c. Success → isVoteConfirmed=true, resume polling
+       d. Failure → rollback hasVoted=false, re-enable buttons
+
+  5. PROMPT CHANGE DETECTION:
+     • Tracks currentVotePromptId
+     • If roundPromptId changes → reset hasVoted, isVoteConfirmed, clear buttons
+     • This is important because each round has 2 voting sessions
+
+  6. NON-VOTING PHASE:
+     • Hide vote card
+     • Reset: hasVoted=false, isVoteConfirmed=false, currentVotePromptId=null
+
+  7. HOST START GAME:
+     • Button appears if isHost && !started && players >= 3
+     • POST /rooms/:code/start → { playerId }
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ B.5. VOTING SAFEGUARDS                                                       │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  1. Double-Click Prevention:
+     - hasVoted = true IMMEDIATELY after click
+     - All buttons disabled
+     - Only rolled back if server rejects or network error
+
+  2. Polling Pause During Submit:
+     - isSubmittingVote = true while POST /vote is in-flight
+     - pollRoom() skips when isSubmittingVote = true
+     - Prevents race conditions where poll response modifies UI during submit
+
+  3. Concurrent Fetch Guard:
+     - isFetchingVoting = true while GET /voting is in-flight
+     - Prevents multiple parallel /voting requests from polling
+
+  4. Button Rebuild Prevention:
+     - If voteOptionsEl.children.length > 0 → skip rebuild
+     - Prevents buttons from disappearing/resetting every polling cycle
+     - Buttons only rebuilt when prompt changes (currentVotePromptId change)
+
+  5. Answerer Detection:
+     - optionPlayers = Set of answerer player IDs
+     - If playerId is in the set → "You answered this one — you cannot vote"
+     - Buttons are not rendered for answerers
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ B.6. ANSWERING SAFEGUARDS                                                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  1. Round 3 Multi-Answer:
+     - requiredAnswerCount = 3 if currentRoundNumber === 3
+     - Shows 3 input fields, validates all must be filled
+     - Submits as { texts: [a1, a2, a3] }
+
+  2. Single Submit:
+     - hasAnswered = true after successful submit
+     - Inputs and button disabled
+     - Resets when phase changes from answering_all
+
+  3. Prompt Change Detection:
+     - currentPromptId cleared when phase != answering_all
+     - When returning to answering_all, fetches a new prompt
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  PART C: COMPLETE BUG FIX SUMMARY (BACKEND + CONTROLLER + UNITY)            ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ C.1. BUG FIX TIMELINE                                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  ┌────┬────────────────────────────────┬──────────────┬──────────────────────┐
+  │ #  │ Bug                            │ File(s)      │ Root Cause           │
+  ├────┼────────────────────────────────┼──────────────┼──────────────────────┤
+  │ 1  │ Vote icons vanish after poll   │ GameManager  │ SetActive(false)     │
+  │    │                                │ .cs          │ called every poll    │
+  ├────┼────────────────────────────────┼──────────────┼──────────────────────┤
+  │ 2  │ Score shows +0 on post-vote    │ GameManager  │ Seat index lookup    │
+  │    │                                │ .cs          │ vs player ID lookup  │
+  ├────┼────────────────────────────────┼──────────────┼──────────────────────┤
+  │ 3  │ Score/vote swapped A↔B         │ server.rooms │ /reveal random order │
+  │    │                                │ .js          │ from DB              │
+  ├────┼────────────────────────────────┼──────────────┼──────────────────────┤
+  │ 4  │ Post-vote votes=0 (stale data) │ GameManager  │ Live players over-   │
+  │    │                                │ .cs          │ written during delay │
+  ├────┼────────────────────────────────┼──────────────┼──────────────────────┤
+  │ 5  │ Prompt 1 always shows +0       │ server.rooms │ Fallback condition   │
+  │    │                                │ .js          │ only checked rp==null│
+  ├────┼────────────────────────────────┼──────────────┼──────────────────────┤
+  │ 6  │ Round 3 plays round 2 video    │ server.rooms │ Cache not invalidated│
+  │    │                                │ .js          │ after startRound()   │
+  ├────┼────────────────────────────────┼──────────────┼──────────────────────┤
+  │ 7  │ Post-vote panel not hidden     │ GameManager  │ Missing FadePanelOut │
+  │    │ when entering session 2        │ .cs          │ in HandleAnsweringAll│
+  │    │                                │              │ and HandleReveal     │
+  ├────┼────────────────────────────────┼──────────────┼──────────────────────┤
+  │ 8  │ Leaderboard sorting incorrect  │ GameManager  │ No SetSiblingIndex   │
+  │    │                                │ .cs          │ for rank ordering    │
+  ├────┼────────────────────────────────┼──────────────┼──────────────────────┤
+  │ 9  │ Leaderboard "no seat found"    │ server.rooms │ Result rows missing  │
+  │    │ warning                        │ .js          │ player `id` field    │
+  └────┴────────────────────────────────┴──────────────┴──────────────────────┘
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ C.2. DETAILED FIX DESCRIPTIONS                                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  #1 — Vote Icons Disappearing
+  ─────────────────────────────
+  Location: GameManager.cs → UpdateVoteIcons()
+  Before:   Called SetActive(true) AND SetActive(false) every poll
+  After:    ONLY calls SetActive(true). Reset only happens in HandleVoting()
+  Why:      Poll responses can temporarily lack new voters, causing icons
+            to flicker off and on.
+
+  #2 — Score +0 (General)
+  ────────────────────────
+  Location: GameManager.cs → HandlePostVotePause()
+  Before:   scorePostVoteTexts[i].text = players[i].votes (seat index)
+  After:    Lookup by answerer player ID:
+            players.Find(p => p.id == currentRevealData.answers[i].player_id)
+  Why:      Seat index 0,1 != answerer A,B. Answerers can occupy any seat.
+
+  #3 — Scores/Votes Swapped A↔B
+  ──────────────────────────────
+  Location: server.rooms.js → GET /rooms/:code/reveal
+  Before:   Answers returned from DB without sorting (random order)
+  After:    sortedAnswers = answers.sort(player1_id first)
+  Why:      Unity: answers[0]=A, answers[1]=B.
+            Server: voterIdsA=player1, voterIdsB=player2.
+            Without sorting, if player2 landed at index 0, everything reversed.
+
+  #4 — Post-Vote Data Stale
+  ──────────────────────────
+  Location: GameManager.cs → PollLobby() + HandlePostVotePause()
+  Before:   HandlePostVotePause() read from `players` (live, votes=0)
+  After:    Snapshot players into cachedPostVotePlayers when post_vote_pause
+            is first detected. HandlePostVotePause() uses the snapshot.
+  Why:      DelayedPostVotePause() delays 5 seconds. During that time,
+            ~7 polls overwrite players with next-prompt data (votes=0).
+
+  #5 — First Prompt Always +0
+  ────────────────────────────
+  Location: server.rooms.js → GET /rooms/:code (post_vote_pause fallback)
+  Before:   const needsDoneFallback = !rp;
+  After:    const needsDoneFallback = !rp || (rp && rp.state !== "voting");
+  Why:      When prompt 1 is done → post_vote_pause, getActiveRoundPrompt()
+            returns prompt 2 (state="answering") because prompt 2 isn't done.
+            rp != null → fallback never runs → votes counted from prompt 2
+            (which has 0 votes) → always shows 0.
+
+  #6 — Round 3 Plays Round 2's Video
+  ───────────────────────────────────
+  Location: server.rooms.js → leaderboard auto-transition
+  Before:   await startRound(room, nextRound); (no cache clear)
+  After:    await startRound(room, nextRound); cacheInvalidateRoom();
+  Why:      getActiveRound() cache 5-10s. After startRound(3), cache still
+            returned round 2. Unity: currentRound=1 (0-based) → rounds[1]
+            = round 2 video.
+
+  #7 — Post-Vote Panel Still Visible in Session 2
+  ─────────────────────────────────────────────────
+  Location: GameManager.cs → HandleAnsweringAll() + HandleReveal()
+  Before:   No FadePanelOut(postVotePausePanel) in either function
+  After:    FadePanelOut(postVotePausePanel) added at the start of both
+  Why:      After session 1 (prompt 1) finishes, the post_vote_pause panel
+            remained active when transitioning to answering_all or reveal
+            for session 2.
+
+  #8 — Leaderboard Sorting Incorrect
+  ───────────────────────────────────
+  Location: GameManager.cs → HandleLeaderboard() + FetchRoundResultsCoroutine()
+  Before:   playerLeaderboardObjects displayed in seat order (0,1,2,3)
+  After:    1. Sort results by totalVotes descending
+            2. Match player ID to seat index
+            3. playerLeaderboardObjects[seatIdx].SetSiblingIndex(rank)
+  Why:      VerticalLayoutGroup displays children by sibling index. Without
+            reordering, the highest-scoring player could appear at the bottom
+            if their seat index was higher.
+
+  #9 — Leaderboard "No Seat Found"
+  ─────────────────────────────────
+  Location: server.rooms.js → handleRoundResults()
+  Before:   rowByPlayer = { name, totalVotes } (no id)
+  After:    rowByPlayer = { id: p.id, name, totalVotes }
+  Why:      Unity searches seatIdx using players.FindIndex(p => p.id == r.id).
+            Without id in the response, r.id = null → FindIndex always
+            returned -1 → warning "no seat found" → empty leaderboard.
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ C.3. DATABASE SCHEMA REFERENCE                                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  rooms
+  ─────
+  id             UUID (PK)
+  code           VARCHAR(4) UNIQUE
+  owner          UUID (nullable)
+  owner_token    VARCHAR (nullable)
+  host_player_id UUID → room_players.id
+  max_players    INT (default 4)
+  started        BOOLEAN
+  state          VARCHAR — lobby/round_intro/answering_all/reveal/voting/
+                           post_vote_pause/leaderboard/results
+  active_prompt_index INT — 0 or 1 (which prompt is currently active)
+  reveal_deadline TIMESTAMPTZ — also reused for post_vote_pause timer
+  leaderboard_deadline TIMESTAMPTZ
+  intro_deadline  TIMESTAMPTZ
+  created_at     TIMESTAMPTZ
+
+  room_players
+  ────────────
+  id             UUID (PK)
+  room_id        UUID → rooms.id
+  display_name   VARCHAR
+  seat           INT
+  joined_at      TIMESTAMPTZ
+
+  rounds
+  ──────
+  id             UUID (PK)
+  room_id        UUID → rooms.id
+  number         INT (1, 2, or 3)
+  state          VARCHAR — active/done
+  created_at     TIMESTAMPTZ
+
+  round_prompts
+  ─────────────
+  id             UUID (PK)
+  round_id       UUID → rounds.id
+  prompt_id      UUID → prompts.id
+  player1_id     UUID → room_players.id
+  player2_id     UUID → room_players.id
+  order_index    INT (0 or 1)
+  state          VARCHAR — answering/voting/done
+  answer_deadline TIMESTAMPTZ
+  vote_deadline   TIMESTAMPTZ
+  created_at     TIMESTAMPTZ
+
+  answers
+  ───────
+  id             UUID (PK)
+  round_id       UUID → rounds.id
+  round_prompt_id UUID → round_prompts.id
+  player_id      UUID → room_players.id
+  text           TEXT
+  created_at     TIMESTAMPTZ
+
+  votes
+  ─────
+  id             UUID (PK)
+  answer_id      UUID → answers.id
+  round_id       UUID → rounds.id
+  round_prompt_id UUID → round_prompts.id
+  voter_player_id UUID → room_players.id
+  created_at     TIMESTAMPTZ
+  UNIQUE(round_prompt_id, voter_player_id) — 1 vote per player per prompt
+
+  prompts
+  ───────
+  id             UUID (PK)
+  text           TEXT
+  category       VARCHAR — round1/round2/round3
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ C.4. SCORING FORMULA                                                         │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  Total Score = Σ (votes_per_answer × 100 × round_multiplier)
+
+  Round Multiplier:
+    Round 1: ×1 → 100 per vote
+    Round 2: ×2 → 200 per vote
+    Round 3: ×3 → 300 per vote
+
+  Example:
+    Player A receives 2 votes in round 1, 1 vote in round 2, 3 votes in round 3
+    Score = (2×100×1) + (1×100×2) + (3×100×3) = 200 + 200 + 900 = 1300
+
+
+================================================================================
+   END OF DOCUMENTATION
+================================================================================
