@@ -5,16 +5,23 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
+import { fileURLToPath } from 'url';
 import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
+// Serve character images for controller UI
+app.use('/chars', express.static(
+    fileURLToPath(new URL('../PartyGame/Assets/Khalid/Char', import.meta.url))
+));
+
 const PORT = process.env.PORT || 3000;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const QUIPLASH_BONUS = 500; // bonus points (before round multiplier) for a unanimous vote
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in env.");
@@ -90,7 +97,7 @@ async function getPlayers(roomId) {
 
     const { data, error } = await supabase
         .from("room_players")
-        .select("id, display_name, joined_at, seat")
+        .select("id, display_name, joined_at, seat, character_index")
         .eq("room_id", roomId)
         .order("seat", { ascending: true, nullsFirst: false })
         .order("joined_at", { ascending: true });
@@ -100,6 +107,7 @@ async function getPlayers(roomId) {
     const result = (data || []).map((p) => ({
         id: p.id,
         name: p.display_name || "Player",
+        characterIndex: p.character_index ?? -1,
     }));
     cacheSet(key, result, 10000);
     return result;
@@ -655,7 +663,18 @@ app.get("/rooms/:code", async (req, res) => {
                         if (rpErr) throw rpErr;
 
                         if (rpToVote) {
-                            const voteSeconds = 25;
+                            // Determine vote window: short for auto-award cases so the
+                            // voting phase is briefly visible, then the voting-phase
+                            // auto-award block fires naturally on the next poll.
+                            const { data: rpAnswerRows } = await supabase
+                                .from("answers")
+                                .select("text")
+                                .eq("round_prompt_id", rpToVote.id);
+                            const realAnswerCount = (rpAnswerRows || []).filter(
+                                a => (a.text || "").trim() !== "Didn't answer"
+                            ).length;
+
+                            const voteSeconds = realAnswerCount <= 1 ? 2 : 25;
                             const voteDeadline = new Date(Date.now() + voteSeconds * 1000).toISOString();
 
                             // atomic guard: only the first poller to clear reveal_deadline wins
@@ -669,18 +688,16 @@ app.get("/rooms/:code", async (req, res) => {
                             if (revealRoomErr) throw revealRoomErr;
 
                             if (votingClaimed && votingClaimed.length > 0) {
-                                // Only update round_prompts if we actually claimed the transition
                                 await supabase
                                     .from("round_prompts")
                                     .update({ state: "voting", vote_deadline: voteDeadline })
                                     .eq("id", rpToVote.id);
 
-                                // Refresh local state so this response is accurate
                                 room.state = "voting";
                                 room.reveal_deadline = null;
                                 cacheInvalidateRoom();
 
-                                console.log(`[rooms] reveal ended -> voting (idx=${idx}) room ${code}`);
+                                console.log(`[rooms] reveal ended -> voting (idx=${idx}, voteSeconds=${voteSeconds}) room ${code}`);
                             }
                         }
                     }
@@ -748,7 +765,7 @@ app.get("/rooms/:code", async (req, res) => {
                         if (doneErr) throw doneErr;
 
                         if (doneRows && doneRows.length > 0) {
-                            const pauseSeconds = 7;
+                            const pauseSeconds = 9;
                             const pauseDeadline = new Date(Date.now() + pauseSeconds * 1000).toISOString();
 
                             await supabase
@@ -905,6 +922,7 @@ app.get("/rooms/:code", async (req, res) => {
                 players = playersBasic.map(p => ({
                     id: p.id,
                     name: p.name,
+                    characterIndex: p.characterIndex,
                     answer: answeredSet.has(p.id) ? "x" : "",
                     votes: playerVotes.get(p.id) || 0,
                 }));
@@ -968,6 +986,7 @@ app.get("/rooms/:code", async (req, res) => {
                     players = playersBasic.map(p => ({
                         id: p.id,
                         name: p.name,
+                        characterIndex: p.characterIndex,
                         answer: "x", // all answered (we're past answering phase)
                         votes: donePlayerVotes.get(p.id) || 0,
                     }));
@@ -1743,6 +1762,40 @@ async function handleRoundResults(req, res) {
 
         }
 
+        // ── Quiplash bonus: both answers real, all eligible votes to one side ──────
+        const answersByPrompt = new Map();
+        for (const a of allAnswers || []) {
+            if (!answersByPrompt.has(a.round_prompt_id)) answersByPrompt.set(a.round_prompt_id, []);
+            answersByPrompt.get(a.round_prompt_id).push(a);
+        }
+        for (const [promptId, promptAnswers] of answersByPrompt) {
+            // Must be a real matchup — both players submitted real answers
+            const realAnswers = promptAnswers.filter(a => (a.text || "").trim() !== "Didn't answer");
+            if (realAnswers.length !== 2) continue;
+
+            const votesA = voteCount.get(realAnswers[0].id) || 0;
+            const votesB = voteCount.get(realAnswers[1].id) || 0;
+            const totalVotes = votesA + votesB;
+            if (totalVotes === 0) continue; // no eligible voters (e.g. 2-player game)
+
+            // Quiplash: one side got ALL the votes, other got none
+            let winnerId = null;
+            if (votesB === 0 && votesA > 0) winnerId = realAnswers[0].player_id;
+            else if (votesA === 0 && votesB > 0) winnerId = realAnswers[1].player_id;
+            if (!winnerId) continue;
+
+            const roundNum = roundNumberById.get(realAnswers[0].round_id) || 1;
+            const mult = roundNum === 3 ? 3 : roundNum === 2 ? 2 : 1;
+            const bonus = QUIPLASH_BONUS * mult;
+
+            const row = rowByPlayer.get(winnerId);
+            if (row) {
+                row.totalVotes += bonus;
+                console.log(`[rooms] QUIPLASH bonus +${bonus} for player ${winnerId} on prompt ${promptId}`);
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────────────
+
         // Final results array sorted by totalVotes desc
         const results = Array.from(rowByPlayer.values())
             .sort((a, b) => b.totalVotes - a.totalVotes);
@@ -1768,6 +1821,49 @@ app.get("/rooms/:code/results", handleRoundResults);
 
 
 
+
+// -----------------------------
+// SELECT CHARACTER
+// POST /rooms/:code/select-character  { playerId, characterIndex }
+// -----------------------------
+app.post("/rooms/:code/select-character", async (req, res) => {
+    try {
+        const code = (req.params.code || "").toUpperCase();
+        const { playerId, characterIndex } = req.body || {};
+
+        if (!Number.isInteger(characterIndex) || characterIndex < 0 || characterIndex > 3)
+            return res.status(400).json({ success: false, error: "invalid_character" });
+        if (!playerId)
+            return res.status(400).json({ success: false, error: "missing_player" });
+
+        const { data: room } = await supabase
+            .from("rooms")
+            .select("id, started")
+            .eq("code", code)
+            .maybeSingle();
+        if (!room) return res.status(404).json({ success: false, error: "room_not_found" });
+        if (room.started) return res.status(409).json({ success: false, error: "game_already_started" });
+
+        // Atomic claim: partial unique index on (room_id, character_index) rejects duplicates
+        const { error: claimErr } = await supabase
+            .from("room_players")
+            .update({ character_index: characterIndex })
+            .eq("id", playerId)
+            .eq("room_id", room.id);
+
+        if (claimErr) {
+            if (claimErr.code === "23505")
+                return res.status(409).json({ success: false, error: "character_taken" });
+            throw claimErr;
+        }
+
+        cacheInvalidateRoom(code);
+        return res.json({ success: true, characterIndex });
+    } catch (err) {
+        console.error("[rooms] select-character error:", err);
+        return res.status(500).json({ success: false, error: "server_error" });
+    }
+});
 
 app.listen(PORT, () => {
     console.log(`Rooms API listening on http://localhost:${PORT}`);
