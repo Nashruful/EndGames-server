@@ -1655,8 +1655,8 @@ async function handleRoundResults(req, res) {
         const round = await getActiveRound(room.id);
         if (!round) return res.status(400).json({ success: false, error: "no_round" });
 
-        // Only serve round results when the room is actually in leaderboard
-        if (room.state !== "leaderboard") {
+        // Serve round results when the room is in leaderboard (mid-game) or results (final)
+        if (room.state !== "leaderboard" && room.state !== "results") {
             return res.status(400).json({ success: false, error: "not_in_leaderboard" });
         }
 
